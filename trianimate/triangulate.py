@@ -265,8 +265,8 @@ def get_triangle_means(
         curr_pts = cv_pts[pts]
         ymin = np.min(curr_pts[:, 1])
         xmin = np.min(curr_pts[:, 0])
-        ymax = np.max(curr_pts[:, 1])
-        xmax = np.max(curr_pts[:, 0])
+        ymax = np.minimum(np.max(curr_pts[:, 1]), h - 1)
+        xmax = np.minimum(np.max(curr_pts[:, 0]), w - 1)
         win_w = xmax - xmin + 1
         win_h = ymax - ymin + 1
         window_pts = curr_pts - np.array([[xmin, ymin]])
