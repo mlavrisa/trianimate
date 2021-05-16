@@ -23,10 +23,10 @@ def _sobel_process(src: np.ndarray) -> np.ndarray:
     scale = 1
     delta = 0
     ksize = 5
-    ddepth = cv.CV_16S
+    ddepth = cv.CV_32F  # cv.CV_16S
 
     # for reducing noise
-    src = np.float32(cv.GaussianBlur(src, (3, 3), 0))
+    src = cv.GaussianBlur(src, (3, 3), 0, borderType=cv.BORDER_REPLICATE)
 
     x_grads = [
         cv.Sobel(
@@ -104,7 +104,8 @@ def _pick_points_winblock(
     h, w, _ = grads.shape
 
     num_points = 4
-    points = np.zeros((int(h * w * 0.1), 2), dtype=np.int32)
+    max_points = int(h * w * 0.1)
+    points = np.zeros((max_points, 2), dtype=np.int32)
 
     # start with the corners
     points[:4] = np.array([[0, 0], [0, w - 1], [h - 1, 0], [h - 1, w - 1]])
@@ -132,7 +133,7 @@ def _pick_points_winblock(
     _fill_block_maxes(grad_norm, maxes, args, 0, w, 0, h, blocksize)
 
     # while the highest remaining gradient norm is greater than bkg, pick another point.
-    while True:
+    while num_points < max_points:
         # find the coordinates and normal vector of the highest point
         y, x = np.reshape(args, (-1, 2))[np.argmax(maxes)]
         if grad_norm[y, x] < bkg:
@@ -206,9 +207,9 @@ def warp_colours(
     else:
         sat_val = 0.0
 
-    if colour_boost > 0:
+    if brightness_boost > 0:
         val_val = 2.0 ** ((1.0 - np.clip(brightness_boost, 0.0, 1.0)) * 4.0 + 5.0)
-    elif colour_boost < 0:
+    elif brightness_boost < 0:
         val_val = -1.0 * 2.0 ** (
             (1.0 - np.clip(-brightness_boost, 0.0, 1.0)) * 4.0 + 5.0
         )
@@ -218,24 +219,24 @@ def warp_colours(
     dims = len(img.shape)
 
     if dims == 2:
-        hsv = cv.cvtColor(img[None, :, :], cv.COLOR_RGB2HSV)
+        hls = cv.cvtColor(img[None, :, :], cv.COLOR_RGB2HLS)
     elif dims == 3:
-        hsv = cv.cvtColor(img, cv.COLOR_RGB2HSV)
+        hls = cv.cvtColor(img, cv.COLOR_RGB2HLS)
     else:
         raise ValueError(f"img must have 2 or 3 dimensions, got {dims}.")
 
     if not sat_val == 0:
-        hsv[:, :, 1] = _warp_exp(hsv[:, :, 1], sat_val)
+        hls[:, :, 2] = _warp_exp(hls[:, :, 2], sat_val)
     if not val_val == 0:
-        hsv[:, :, 2] = _warp_exp(hsv[:, :, 2], val_val)
+        hls[:, :, 1] = _warp_exp(hls[:, :, 1], val_val)
 
     if dims == 2:
-        return cv.cvtColor(hsv, cv.COLOR_HSV2RGB)[0]
+        return cv.cvtColor(hls, cv.COLOR_HLS2RGB)[0]
     else:
-        return cv.cvtColor(hsv, cv.COLOR_HSV2RGB)
+        return cv.cvtColor(hls, cv.COLOR_HLS2RGB)
 
 
-def get_triangle_means(
+def find_colours(
     img: np.ndarray, vertices: np.ndarray, faces: np.ndarray
 ) -> np.ndarray:
     """Get triangle colours.
@@ -265,8 +266,8 @@ def get_triangle_means(
         curr_pts = cv_pts[pts]
         ymin = np.min(curr_pts[:, 1])
         xmin = np.min(curr_pts[:, 0])
-        ymax = np.max(curr_pts[:, 1])
-        xmax = np.max(curr_pts[:, 0])
+        ymax = np.minimum(np.max(curr_pts[:, 1]), h - 1)
+        xmax = np.minimum(np.max(curr_pts[:, 0]), w - 1)
         win_w = xmax - xmin + 1
         win_h = ymax - ymin + 1
         window_pts = curr_pts - np.array([[xmin, ymin]])
@@ -282,7 +283,7 @@ def get_triangle_means(
     return cols
 
 
-def triangulate(
+def find_vertices(
     img: np.ndarray, detail: float = 0.5, threshold: float = 0.5, max_dim: int = 1024
 ) -> np.ndarray:
     """Find key points on an image and create a triangulation.
@@ -321,7 +322,7 @@ def triangulate(
         img = cv.resize(img, (w, h), interpolation=cv.INTER_AREA)
     else:
         h, w = oh, ow
-    spread = max(h, w) // det_val
+    spread = max(max(h, w) // det_val, 1)
 
     # calculate the grads and norm, and the threshold value
     grads = _sobel_process(img)
@@ -329,15 +330,24 @@ def triangulate(
     bkg = np.percentile(grad_norm, thresh_val)
 
     # determine the image's critical points
-    points = _pick_points_winblock(np.float32(grads), grad_norm, spread, bkg)
-
-    # delaunay triangulation from scipy
-    tri = Delaunay(points)
+    points = _pick_points_winblock(grads, grad_norm, spread, bkg)
 
     # scale the points to be in [0, 1)
     scale_pts = points / np.array([[w - 1, h - 1]])
 
-    return scale_pts, tri.simplices
+    return scale_pts
+
+
+def find_faces(vertices: np.ndarray) -> np.ndarray:
+    """Wrapper of scipy.spatial.Delaunay which returns the simplex indices.
+    
+    Args:
+        vertices: `np.ndarray` points on a 2D plane to triangulate
+        
+    Returns:
+        The Delaunay triangulation of the points, as an (Nf, 3) array of indices."""
+    tri = Delaunay(vertices)
+    return tri.simplices
 
 
 def classic_triangulate(
@@ -356,18 +366,19 @@ def classic_triangulate(
     the arguments and return values.
 
     Args:
-        img: input image `np.ndarray`
-        detail: level of detail `float`
-        threshold: fraction of img considered background `float`
-        colour_boost: how much to boost the colour by `float`
-        max_dim: shrink the image if it's above this size.
+        img: `np.ndarray` input image
+        detail: `float` level of detail (0., 1.)
+        threshold: `float` fraction of img considered background (0., 1.)
+        colour_boost: `float` how much to boost the colour by (-1., 1.)
+        max_dim: `int` shrink the image if it's above this size
     
     Returns:
         vertices, faces and colours of the triangulation, as `np.ndarray`s
     """
     img = warp_colours(img, colour_boost, colour_boost)
-    vertices, faces = triangulate(img, detail, threshold, max_dim)
-    cols = get_triangle_means(img, vertices, faces)
+    vertices = find_vertices(img, detail, threshold, max_dim)
+    faces = find_faces(vertices)
+    cols = find_colours(img, vertices, faces)
     cols = warp_colours(cols, colour_boost, 0.0)
 
     return vertices, faces, cols
