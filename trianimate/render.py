@@ -10,7 +10,7 @@ class TriangleShader:
         """TriangleShader renders triangulations using OpenGL.
         
         Please see render_2d and render_3d"""
-        self.ctx: moderngl.Context = moderngl.create_standalone_context()
+        self._ctx: moderngl.Context = moderngl.create_standalone_context()
 
         self._width = -1
         self._height = -1
@@ -59,7 +59,7 @@ class TriangleShader:
             colours.shape[0] == vertices.shape[0] or colours.shape[0] == faces.shape[0]
         )
 
-        program = self.ctx.program(
+        program = self._ctx.program(
             vertex_shader=self.vert_shader_2d, fragment_shader=self.frag_shader_2d,
         )
 
@@ -70,8 +70,8 @@ class TriangleShader:
             cols = colours[faces.ravel()] / 255.0
         vertices = np.concatenate([xy, cols], axis=1)
 
-        self._vbo = self.ctx.buffer(vertices.astype("f4").tobytes())
-        self._vao = self.ctx.simple_vertex_array(
+        self._vbo = self._ctx.buffer(vertices.astype("f4").tobytes())
+        self._vao = self._ctx.simple_vertex_array(
             program, self._vbo, "in_vert", "in_color"
         )
 
@@ -79,13 +79,14 @@ class TriangleShader:
         self._fbo_msaa.clear(0.0, 0.0, 0.0, 1.0)
         self._vao.render()
 
-        self.ctx.copy_framebuffer(self._fbo_ds, self._fbo_msaa)
+        self._ctx.copy_framebuffer(self._fbo_ds, self._fbo_msaa)
         frame_bytes = self._fbo_ds.read(components=3, alignment=1)
 
         # haven't actually tested, but releasing these now
         # vertices might be a different size next frame
         self._vbo.release()
         self._vao.release()
+        program.release()
 
         return np.frombuffer(frame_bytes, dtype=np.uint8).reshape(
             (self._height, self._width, 3)
@@ -121,10 +122,10 @@ class TriangleShader:
         assert width > 0 and height > 0
         self._width = width
         self._height = height
-        self._rbo_msaa = self.ctx.renderbuffer((width, height), samples=8)
-        self._rbo_ds = self.ctx.renderbuffer((width, height))
-        self._fbo_msaa = self.ctx.framebuffer(self._rbo_msaa)
-        self._fbo_ds = self.ctx.framebuffer(self._rbo_ds)
+        self._rbo_msaa = self._ctx.renderbuffer((width, height), samples=8)
+        self._rbo_ds = self._ctx.renderbuffer((width, height))
+        self._fbo_msaa = self._ctx.framebuffer(self._rbo_msaa)
+        self._fbo_ds = self._ctx.framebuffer(self._rbo_ds)
 
         try:
             yield self._render_2d
@@ -135,10 +136,11 @@ class TriangleShader:
             self._rbo_ds.release()
             self._fbo_msaa.release()
             self._fbo_ds.release()
+            self._ctx.release()
             self._vbo = None
             self._vao = None
             self._rbo_msaa = None
             self._rbo_ds = None
             self._fbo_msaa = None
             self._fbo_ds = None
-
+            self._ctx = None

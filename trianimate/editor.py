@@ -9,9 +9,9 @@ from typing import Callable
 
 import cv2 as cv
 import numpy as np
-from PyQt5.QtCore import Qt
-from PyQt5.QtGui import (QCloseEvent, QColor, QIcon, QImage, QPalette, QPixmap,
-                         QValidator)
+from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal
+from PyQt5.QtGui import (QCloseEvent, QColor, QIcon, QImage, QMouseEvent,
+                         QPalette, QPixmap, QValidator)
 from PyQt5.QtWidgets import (QAction, QApplication, QCheckBox, QFileDialog,
                              QFrame, QGridLayout, QLabel, QLineEdit,
                              QMainWindow, QMenuBar, QMessageBox, QPushButton,
@@ -103,6 +103,63 @@ class CallableValidator(QValidator):
         )
 
 
+class TriangulateWorker(QObject):
+    """Worker object for processing triangulations done in numba in parallel."""
+
+    finished = pyqtSignal(np.ndarray, np.ndarray, np.ndarray, np.ndarray)
+    progress = pyqtSignal(int)
+
+    def __init__(
+        self,
+        img: np.ndarray,
+        detail: float,
+        threshold: float,
+        colour_boost: float,
+        brightness_boost: float,
+        maxd: int,
+    ):
+        """Create a new worker, pass in all the relevant values to triangulate.
+        
+        Args:
+            img: `np.ndarray` (dtype: uint8, ndim: 3) the image
+            detail: `float` value between 0 and 1 indicating the level of detail
+            threshold: `float` value between 0 and 1 indicating background fraction
+            colour_boost: `float` value between -1 and 1 indicating saturation change
+            brightness_boost: `float` value between -1 and 1 indicating value change
+        """
+        super().__init__()
+        self.img = img
+        self.detail = detail
+        self.threshold = threshold
+        self.colour_boost = colour_boost
+        self.brightness_boost = brightness_boost
+        self.maxd = maxd
+
+    def run(self):
+        """Runs the triangulation, generates a preview image, emits finished signal."""
+        img = warp_colours(self.img, self.colour_boost, self.brightness_boost)
+        vertices = find_vertices(img, self.detail, self.threshold)
+        faces = find_faces(vertices)
+        cols = find_colours(img, vertices, faces)
+        colours = warp_colours(cols, self.colour_boost, 0.0)
+
+        # longest dimension of preview should always be self.maxd px
+        aspect = self.img.shape[0] / self.img.shape[1]
+        if aspect >= 1:
+            h = self.maxd
+            w = round(self.maxd / aspect)
+        else:
+            w = self.maxd
+            h = round(self.maxd * aspect)
+
+        # render the preview
+        with TriangleShader().render_2d(w, h) as render:
+            preview = render(vertices, faces, colours)
+
+        # emit the finished signal, pass along the calculated values
+        self.finished.emit(preview, vertices, faces, colours)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         """Main application window for triangulating and animating images"""
@@ -178,8 +235,14 @@ class MainWindow(QMainWindow):
         self.animations = []
         self.depths = None
 
+        self.preview_thread = QThread()
+        self.preview_worker = None
+        self.numba_compiled = False
+        self.imported = False
+
         # set everything up
         self.init_ui()
+        self._init_numba_jit()
 
     def init_ui(self):
         """Initialize the user interface, set up events, etc."""
@@ -319,6 +382,29 @@ class MainWindow(QMainWindow):
 
         self.showMaximized()
 
+    def _init_numba_jit(self):
+        """Runs numba pre-compilation on those functions which use it."""
+        img = np.random.randint(0, 256, (10, 10, 3), dtype=np.uint8)
+        self.preview_worker = TriangulateWorker(img, 0.0, 0.0, 0.0, 0.0, self.maxd,)
+        self.preview_worker.moveToThread(self.preview_thread)
+
+        self.preview_thread.started.connect(self.preview_worker.run)
+        self.preview_worker.finished.connect(self._end_numba_jit)
+        self.preview_thread.finished.connect(self.preview_thread.deleteLater)
+
+        self.preview_thread.start()
+        self.triangle_btn.setText("Compiling Scripts...")
+
+    def _end_numba_jit(self, *args):
+        """Callback for numba pre-compilation."""
+        self.numba_compiled = True
+        self.triangle_btn.setText("Triangulate")
+        if self.imported:
+            self.triangle_btn.setEnabled(True)
+
+        self.preview_thread.quit()
+        self.preview_worker.deleteLater()
+
     # TODO: when animations are implemented, ask if you want to save your work first
     def import_img(self, _):
         """Handler for import action - load an image into the tool.
@@ -351,6 +437,11 @@ class MainWindow(QMainWindow):
                 self.export_width = int(ow * export_factor)
                 self.export_height_txt.setText(str(self.export_height))
                 self.export_width_txt.setText(str(self.export_width))
+            else:
+                self.export_height = oh
+                self.export_width = ow
+                self.export_height_txt.setText(str(self.export_height))
+                self.export_width_txt.setText(str(self.export_width))
 
             # rescale the image down to self.maxd if necessary
             if oh > self.maxd or ow > self.maxd:
@@ -374,43 +465,14 @@ class MainWindow(QMainWindow):
             self.img_label.setPixmap(QPixmap.fromImage(self.image))
 
             # if this is our first image, we can now triangulate it!
-            self.triangle_btn.setEnabled(True)
+            self.imported = True
+            if self.numba_compiled:
+                self.triangle_btn.setEnabled(True)
             # but our triangulation is gone, so we cannot export
-            self.export_frame_btn.setEnabled(True)
+            self.export_frame_btn.setEnabled(False)
             self.vertices = None
             self.faces = None
             self.colours = None
-
-    def export_frame(self, _):
-        """Exports a static image of a triangulation."""
-        # open file picker to save the image
-        options = QFileDialog.Options()
-        options |= QFileDialog.DontUseNativeDialog
-        filename, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save to Image",
-            "",
-            "Image Files (*.jpg *.jpeg *.gif *.bmp *.png)",
-            options=options,
-        )
-        if not filename:
-            return
-
-        # if vertices is 2D, it's a static image, if 3D, it's an animation
-        # TODO: If it's an animation, provide a selector for the frame
-        if len(self.vertices.shape) == 2:
-            with TriangleShader().render_2d(
-                self.export_width, self.export_height
-            ) as render:
-                result = render(self.vertices, self.faces, self.colours)
-        elif len(self.vertices.shape) == 3:
-            with TriangleShader().render_2d(
-                self.export_width, self.export_height
-            ) as render:
-                result = render(self.vertices[0], self.faces[0], self.colours[0])
-
-        # opencv likes to write BGR for whatever reason :/
-        cv.imwrite(filename, cv.cvtColor(result, cv.COLOR_RGB2BGR))
 
     def validate_width(self, txt: str) -> bool:
         """Would the resulting resolution be less than 8k?"""
@@ -532,23 +594,34 @@ class MainWindow(QMainWindow):
         thr_val = self.thresh_sld.value() / 100.0
         col_val = self.colour_sld.value() / 100.0
         brt_val = self.bright_sld.value() / 100.0
-        img = warp_colours(self.img, col_val, brt_val)
-        self.vertices = find_vertices(img, det_val, thr_val)
-        self.faces = find_faces(self.vertices)
-        cols = find_colours(img, self.vertices, self.faces)
-        self.colours = warp_colours(cols, col_val, 0.0)
 
-        # generate preview from image, longest dimension should always be self.maxd px
-        aspect = self.img.shape[0] / self.img.shape[1]
-        if aspect >= 1:
-            h = self.maxd
-            w = round(self.maxd / aspect)
-        else:
-            w = self.maxd
-            h = round(self.maxd * aspect)
+        self.triangle_btn.setDisabled(True)
+        self.triangle_btn.setText("Working...")
 
-        with TriangleShader().render_2d(w, h) as render:
-            self.preview = render(self.vertices, self.faces, self.colours)
+        self.preview_worker = TriangulateWorker(
+            self.img, det_val, thr_val, col_val, brt_val, self.maxd,
+        )
+        self.preview_thread = QThread()
+        self.preview_worker.moveToThread(self.preview_thread)
+
+        self.preview_thread.started.connect(self.preview_worker.run)
+        self.preview_worker.finished.connect(self.show_triangulate_preview)
+        self.preview_thread.finished.connect(self.preview_thread.deleteLater)
+        self.preview_thread.start()
+
+    def show_triangulate_preview(
+        self,
+        preview: np.ndarray,
+        vertices: np.ndarray,
+        faces: np.ndarray,
+        colours: np.ndarray,
+    ):
+        """Collects the triangulation result and shows the preview."""
+        self.preview = preview
+        self.vertices = vertices
+        self.faces = faces
+        self.colours = colours
+        h, w, _ = self.preview.shape
 
         # set the preview image
         self.image = QImage(
@@ -562,13 +635,50 @@ class MainWindow(QMainWindow):
 
         # Once we have run a triangulation, we can export!
         self.export_frame_btn.setEnabled(True)
+        self.triangle_btn.setEnabled(True)
+        self.triangle_btn.setText("Triangulate")
+
+        # clean up thread
+        self.preview_thread.quit()
+        self.preview_worker.deleteLater()
+
+    def export_frame(self, _):
+        """Exports a static image of a triangulation."""
+        # open file picker to save the image
+        options = QFileDialog.Options()
+        options |= QFileDialog.DontUseNativeDialog
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save to Image",
+            "",
+            "Image Files (*.jpg *.jpeg *.gif *.bmp *.png)",
+            options=options,
+        )
+        if not filename:
+            return
+
+        # if vertices is 2D, it's a static image, if 3D, it's an animation
+        # TODO: If it's an animation, provide a selector for the frame
+        if len(self.vertices.shape) == 2:
+            with TriangleShader().render_2d(
+                self.export_width, self.export_height
+            ) as render:
+                result = render(self.vertices, self.faces, self.colours)
+        elif len(self.vertices.shape) == 3:
+            with TriangleShader().render_2d(
+                self.export_width, self.export_height
+            ) as render:
+                result = render(self.vertices[0], self.faces[0], self.colours[0])
+
+        # opencv likes to write BGR for whatever reason :/
+        cv.imwrite(filename, cv.cvtColor(result, cv.COLOR_RGB2BGR))
 
     def save_work(self):
         """Write a project file for each image which can be reopened later."""
         # Not implemented
         self.saved = True
 
-    def closeEvent(self, event: QCloseEvent):
+    def close_event(self, event: QCloseEvent):
         """Handler for the window being closed - prompts the user to save if needed."""
         if self.saved:
             event.accept()

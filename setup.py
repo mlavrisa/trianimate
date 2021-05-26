@@ -1,6 +1,6 @@
 from setuptools import setup, find_packages
 
-VERSION = '0.0.1' 
+VERSION = '0.1.0' 
 DESCRIPTION = 'Trianimate'
 LONG_DESCRIPTION = 'Triangulate images and then animate them!'
 
@@ -15,12 +15,16 @@ setup(
         packages=find_packages(),
         install_requires=[
             'numpy',
-            'scipy'
+            'scipy',
+            'opencv',
+            'moderngl',
+            'pyqt'
         ],
         keywords=['python', 'triangulation', 'animation'],
         classifiers= [
-            "Development Status :: 1 - Planning",
+            "Development Status :: 2 - Pre-Alpha",
             "Intended Audience :: End Users/Desktop",
+            "Intended Audience :: Other Audience",
             "Programming Language :: Python :: 3",
             "Operating System :: MacOS :: MacOS X",
             "Operating System :: Microsoft :: Windows",
