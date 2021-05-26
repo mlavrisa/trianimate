@@ -18,6 +18,8 @@ import numpy as np
 import numpy.linalg as linalg
 from scipy.spatial import Delaunay
 
+from trianimate.triangulate_utils import _pick_points_winblock
+
 
 def _sobel_process(src: np.ndarray) -> np.ndarray:
     scale = 1
@@ -61,119 +63,10 @@ def _sobel_process(src: np.ndarray) -> np.ndarray:
     return grad
 
 
-def _fill_block_maxes(
-    img: np.ndarray,
-    maxes: np.ndarray,
-    args: np.ndarray,
-    xmin: int,
-    xmax: int,
-    ymin: int,
-    ymax: int,
-    blocksize: int,
-):
-    # maxes is the maximum values within each block
-    # args is an array of the argmaxes within each block (but relative to the whole img)
-    # break the image up into blocks, only iterate over the blocks that touch ymin->xmax
-    w = img.shape[1]
-    imin = xmin // blocksize
-    imax = xmax // blocksize + 1
-    jmin = ymin // blocksize
-    jmax = ymax // blocksize + 1
-    for jdx in range(jmin, jmax):
-        for idx in range(imin, imax):
-            # how wide is the block we're looking at (relevant at border)
-            xsize = np.minimum(w - idx * blocksize, blocksize)
-
-            # find the argmax within the block, but set args relative to whole image
-            argmax = np.argmax(
-                img[
-                    jdx * blocksize : (jdx + 1) * blocksize,
-                    idx * blocksize : (idx + 1) * blocksize,
-                ]
-            )
-            x, y = idx * blocksize + argmax % xsize, jdx * blocksize + argmax // xsize
-            args[jdx, idx] = np.array([y, x])
-
-            # find the max value for the block, and set maxes
-            maxes[jdx, idx] = img[y, x]
-
-
-def _pick_points_winblock(
-    grads: np.ndarray, grad_norm: np.ndarray, dot_dist: float, bkg: float
-) -> np.ndarray:
-    h, w, _ = grads.shape
-
-    num_points = 4
-    max_points = int(h * w * 0.1)
-    points = np.zeros((max_points, 2), dtype=np.int32)
-
-    # start with the corners
-    points[:4] = np.array([[0, 0], [0, w - 1], [h - 1, 0], [h - 1, w - 1]])
-
-    # construct mesh and gassians outside of the loop, only need to once
-    xsn, ysn = np.meshgrid(
-        np.arange(-2 * dot_dist, 2 * dot_dist + 1),
-        np.arange(-2 * dot_dist, 2 * dot_dist + 1),
-    )
-    gsn_dot = np.exp(-0.5 * (np.square(xsn) + np.square(ysn)) / (dot_dist ** 2))
-    gsn_dst = 1.0 - np.exp(
-        -0.5 * (np.square(xsn) + np.square(ysn)) / ((dot_dist / 4) ** 2)
-    )
-
-    # calculate the normalized gradients, just need this once
-    normals = grads / grad_norm[:, :, None]
-
-    # calculate the blocks to speed up argmax
-    # why x2? Empirical finding, 3.5% speedup.
-    blocksize = int(np.sqrt(np.sqrt(h * w)) * 2.0)
-    maxes = np.zeros((int(np.ceil(h / blocksize)), int(np.ceil(w / blocksize))))
-    args = np.zeros(
-        (int(np.ceil(h / blocksize)), int(np.ceil(w / blocksize)), 2), dtype=np.int32
-    )
-    _fill_block_maxes(grad_norm, maxes, args, 0, w, 0, h, blocksize)
-
-    # while the highest remaining gradient norm is greater than bkg, pick another point.
-    while num_points < max_points:
-        # find the coordinates and normal vector of the highest point
-        y, x = np.reshape(args, (-1, 2))[np.argmax(maxes)]
-        if grad_norm[y, x] < bkg:
-            break
-        points[num_points] = np.array((y, x))
-        normal = normals[y, x]
-
-        # calculate the windows
-        xmin = np.maximum(x - 2 * dot_dist, 0)
-        xmax = np.minimum(x + 2 * dot_dist + 1, w)
-        ymin = np.maximum(y - 2 * dot_dist, 0)
-        ymax = np.minimum(y + 2 * dot_dist + 1, h)
-        gxmin = xmin - (x - 2 * dot_dist)
-        gxmax = (4 * dot_dist + 1) - ((x + 2 * dot_dist + 1) - xmax)
-        gymin = ymin - (y - 2 * dot_dist)
-        gymax = (4 * dot_dist + 1) - ((y + 2 * dot_dist + 1) - ymax)
-
-        # calculate the gradient norm window
-        normalwin = normals[ymin:ymax, xmin:xmax]
-
-        # calculate the points within the window that match the gradient
-        dot_distwin = np.maximum(0.0, np.dot(normalwin, normal))
-
-        # calculate the decrease in the gradient, and apply it
-        dot_dec = 1.0 - gsn_dot[gymin:gymax, gxmin:gxmax] * dot_distwin
-        dst_dec = gsn_dst[gymin:gymax, gxmin:gxmax]
-        factor = dot_dec * dst_dec
-        grads[ymin:ymax, xmin:xmax] *= factor[:, :, None]
-        grad_norm[ymin:ymax, xmin:xmax] *= factor
-        _fill_block_maxes(grad_norm, maxes, args, xmin, xmax, ymin, ymax, blocksize)
-
-        # recalculate the norm
-        num_points += 1
-    return points[:num_points, [1, 0]]
-
-
 def _warp_exp(cols: np.ndarray, factor: float) -> np.ndarray:
-    # smooth function which curves between 0 and 255 and returns as uint8
+    # smooth function which curves between 0 and 255
     # the farther factor is from 0, the more extreme the warp
-    return np.uint8(255 * (1 - np.exp(cols / (-factor))) / (1 - np.exp(-255 / factor)))
+    return np.int32(255 * (1 - np.exp(-cols * factor)) / (1 - np.exp(-255.0 * factor)))
 
 
 def warp_colours(
@@ -200,40 +93,27 @@ def warp_colours(
         ValueError: img must have 2 or 3 dimensions.
     """
 
-    if colour_boost > 0:
-        sat_val = 2.0 ** ((1.0 - np.clip(colour_boost, 0.0, 1.0)) * 4.0 + 5.0)
-    elif colour_boost < 0:
-        sat_val = -1.0 * 2.0 ** ((1.0 - np.clip(-colour_boost, 0.0, 1.0)) * 4.0 + 5.0)
-    else:
-        sat_val = 0.0
-
-    if brightness_boost > 0:
-        val_val = 2.0 ** ((1.0 - np.clip(brightness_boost, 0.0, 1.0)) * 4.0 + 5.0)
-    elif brightness_boost < 0:
-        val_val = -1.0 * 2.0 ** (
-            (1.0 - np.clip(-brightness_boost, 0.0, 1.0)) * 4.0 + 5.0
-        )
-    else:
-        val_val = 0.0
+    sat_val = np.clip(colour_boost, -1.0, 1.0) * 2.5e-2
+    val_val = np.clip(brightness_boost, -1.0, 1.0) * 1.25e-2
 
     dims = len(img.shape)
 
     if dims == 2:
-        hls = cv.cvtColor(img[None, :, :], cv.COLOR_RGB2HLS)
+        hls = cv.cvtColor(img[None, :, :], cv.COLOR_RGB2HLS).astype(np.int32)
     elif dims == 3:
-        hls = cv.cvtColor(img, cv.COLOR_RGB2HLS)
+        hls = cv.cvtColor(img, cv.COLOR_RGB2HLS).astype(np.int32)
     else:
         raise ValueError(f"img must have 2 or 3 dimensions, got {dims}.")
 
-    if not sat_val == 0:
-        hls[:, :, 2] = _warp_exp(hls[:, :, 2], sat_val)
-    if not val_val == 0:
+    if abs(val_val) > 1e-6:
         hls[:, :, 1] = _warp_exp(hls[:, :, 1], val_val)
+    if abs(sat_val) > 1e-6:
+        hls[:, :, 2] = _warp_exp(hls[:, :, 2], sat_val)
 
     if dims == 2:
-        return cv.cvtColor(hls, cv.COLOR_HLS2RGB)[0]
+        return cv.cvtColor(hls.astype(np.uint8), cv.COLOR_HLS2RGB)[0]
     else:
-        return cv.cvtColor(hls, cv.COLOR_HLS2RGB)
+        return cv.cvtColor(hls.astype(np.uint8), cv.COLOR_HLS2RGB)
 
 
 def find_colours(
@@ -302,12 +182,9 @@ def find_vertices(
             its maximum dimension is this size. This reduces computation time.
     
     Returns:
-        a tuple of two `np.ndarray`s. The first is an array of points on the image,
-        making up the triangle vertices as [x, y] pairs. This is scaled to the range
-        [0, 1] to be easily resized to other image dimensions or aspect ratios. Its
-        dimensions are (Npts, 2). The second `np.ndarray` contains the indices within 
-        the returned points array, corresponding to aDelaunay triangulation of the
-        points. dims: (Ntri, 3), dtype: np.int32
+        an `np.ndarray` with points on the image, making up the triangle vertices as
+        [x, y] pairs. This is scaled to the range [0, 1] to be easily resized to other
+        image dimensions or aspect ratios. Its dimensions are (Npts, 2).
     """
 
     # calculate the constants used in the various calculations
