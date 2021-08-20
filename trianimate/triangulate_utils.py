@@ -2,6 +2,7 @@ from typing import Tuple
 
 import numpy as np
 from numba import njit
+from math import ceil
 
 
 @njit
@@ -18,9 +19,9 @@ def _fill_block_maxes(
     """Iterates over regions of an image, calculating and storing the argmax of each."""
     w = grad_norm.shape[1]
     imin = xmin // blocksize
-    imax = xmax // blocksize + 1
+    imax = ceil(xmax / blocksize)
     jmin = ymin // blocksize
-    jmax = ymax // blocksize + 1
+    jmax = ceil(ymax / blocksize)
     irng = imax - imin
     jrng = jmax - jmin
 
@@ -153,3 +154,55 @@ def _pick_points_winblock(
         # recalculate the norm
         num_points += 1
     return points[:num_points]
+
+
+@njit
+def _points_in_polygon(points: np.ndarray, polygon: np.ndarray) -> np.ndarray:
+    """Implements the crossing algorithm to determine whether points are in polygon."""
+    # setup
+    n_p = len(points)
+    n_v = len(polygon) - 1
+    count = np.zeros((n_p,), dtype=np.int32)
+    xs = polygon[:n_v, 0]
+    xe = polygon[1:, 0]
+    ys = polygon[:n_v, 1]
+    ye = polygon[1:, 1]
+
+    minx = np.min(polygon[:, 0])
+    maxx = np.max(polygon[:, 0])
+    miny = np.min(polygon[:, 1])
+    maxy = np.max(polygon[:, 1])
+
+    # only need to calculate these things once, then just grab items from them
+    dx = xe - xs
+    dy = ye - ys
+    dxdy = dx / dy
+
+    # iterate over the points
+    for pdx in range(n_p):
+        if (
+            points[pdx, 0] > maxx
+            or points[pdx, 0] < minx
+            or points[pdx, 1] > maxy
+            or points[pdx, 1] < miny
+        ):
+            continue
+        # find the polygon edges which a horizontal line through point intersects with
+        # if line slopes up, can intersect with the starting point but not the end
+        # if line slopes down, can intersect with the end but not the start
+        # horizontal lines will be left out, but that's okay! One of the neighbouring
+        # segments will capture the appropriate interaction
+        level_with = np.logical_or(
+            np.logical_and(ys <= points[pdx, 1], ye > points[pdx, 1]),
+            np.logical_and(ys > points[pdx, 1], ye <= points[pdx, 1]),
+        )
+        # iterate over those edges, only if edges are level with
+        for vdx in range(n_v):
+            if level_with[vdx]:
+                # if so, calculate the x coordinate, check we are left of that
+                vt = points[pdx, 1] - ys[vdx]
+                if points[pdx, 0] < xs[vdx] + vt * dxdy[vdx]:
+                    count[pdx] += 1
+
+    # if crossings are odd, the point is in the polygon
+    return np.equal(np.remainder(count, 2), 1)

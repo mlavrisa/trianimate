@@ -5,80 +5,44 @@ Run this module from the command line, or python -m trianimate
 import re
 import sys
 from os.path import abspath, join, split
+from trianimate.palette import QDarkPalette
+from trianimate.animation import AnimationEditor
+from trianimate.triangulate_utils import _points_in_polygon
 from typing import Callable
 
 import cv2 as cv
 import numpy as np
 from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal
-from PyQt5.QtGui import (QCloseEvent, QColor, QIcon, QImage, QMouseEvent,
-                         QPalette, QPixmap, QValidator)
-from PyQt5.QtWidgets import (QAction, QApplication, QCheckBox, QFileDialog,
-                             QFrame, QGridLayout, QLabel, QLineEdit,
-                             QMainWindow, QMenuBar, QMessageBox, QPushButton,
-                             QSlider, QTabWidget, QToolBar, QVBoxLayout,
-                             QWidget)
+from PyQt5.QtGui import (
+    QCloseEvent,
+    QIcon,
+    QImage,
+    QMouseEvent,
+    QPixmap,
+    QValidator,
+)
+from PyQt5.QtWidgets import (
+    QAction,
+    QApplication,
+    QCheckBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenuBar,
+    QMessageBox,
+    QPushButton,
+    QSlider,
+    QTabWidget,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
 
 from trianimate.render import TriangleShader
-from trianimate.triangulate import (find_colours, find_faces, find_vertices,
-                                    warp_colours)
-
-WHITE = QColor(255, 255, 255)
-BLACK = QColor(0, 0, 0)
-RED = QColor(255, 0, 0)
-PRIMARY = QColor(53, 53, 53)
-SECONDARY = QColor(35, 35, 35)
-TERTIARY = QColor(42, 130, 218)
-QUATERNARY = QColor(78, 78, 78)
-
-
-def css_rgb(color, a=False):
-    """Get a CSS `rgb` or `rgba` string from a `QtGui.QColor`."""
-    return ("rgba({}, {}, {}, {})" if a else "rgb({}, {}, {})").format(*color.getRgb())
-
-
-def set_stylesheet(app):
-    """Static method to set the tooltip stylesheet to a `QtWidgets.QApplication`."""
-    app.setStyleSheet(
-        "QToolTip {{"
-        "color: {white};"
-        "background-color: {tertiary};"
-        "border: 1px solid {white};"
-        "}}".format(white=css_rgb(WHITE), tertiary=css_rgb(TERTIARY))
-    )
-
-
-class QDarkPalette(QPalette):
-    """Dark palette for a Qt application meant to be used with the Fusion theme."""
-
-    def __init__(self, *__args):
-        super().__init__(*__args)
-
-        # Set all the colors based on the constants in globals
-        self.setColor(QPalette.Window, PRIMARY)
-        self.setColor(QPalette.WindowText, WHITE)
-        self.setColor(QPalette.Base, SECONDARY)
-        self.setColor(QPalette.AlternateBase, PRIMARY)
-        self.setColor(QPalette.ToolTipBase, WHITE)
-        self.setColor(QPalette.ToolTipText, WHITE)
-        self.setColor(QPalette.Text, WHITE)
-        self.setColor(QPalette.Button, PRIMARY)
-        self.setColor(QPalette.ButtonText, WHITE)
-        self.setColor(QPalette.BrightText, RED)
-        self.setColor(QPalette.Link, TERTIARY)
-        self.setColor(QPalette.Highlight, TERTIARY)
-        self.setColor(QPalette.HighlightedText, BLACK)
-        self.setColor(QPalette.Disabled, QPalette.WindowText, SECONDARY)
-        self.setColor(QPalette.Disabled, QPalette.WindowText, SECONDARY)
-        self.setColor(QPalette.Disabled, QPalette.Text, SECONDARY)
-        self.setColor(QPalette.Disabled, QPalette.Light, PRIMARY)
-        self.setColor(QPalette.Disabled, QPalette.ButtonText, QUATERNARY)
-        self.setColor(QPalette.Disabled, QPalette.Button, SECONDARY)
-
-    def set_app(self, app):
-        """Set the Fusion theme and this palette to a `QtWidgets.QApplication`."""
-        app.setStyle("Fusion")
-        app.setPalette(self)
-        set_stylesheet(app)
+from trianimate.triangulate import find_colours, find_faces, find_vertices, warp_colours
 
 
 class CallableValidator(QValidator):
@@ -107,7 +71,6 @@ class TriangulateWorker(QObject):
     """Worker object for processing triangulations done in numba in parallel."""
 
     finished = pyqtSignal(np.ndarray, np.ndarray, np.ndarray, np.ndarray)
-    progress = pyqtSignal(int)
 
     def __init__(
         self,
@@ -160,6 +123,80 @@ class TriangulateWorker(QObject):
         self.finished.emit(preview, vertices, faces, colours)
 
 
+class LassoWorker(QObject):
+    """Worker object for processing lasso selection done in numba in parallel."""
+
+    finished = pyqtSignal(np.ndarray, int)
+
+    def __init__(
+        self, vertices: np.ndarray, polygon: np.ndarray, modifier: int,
+    ):
+        """Create a new worker, pass in all the relevant values to select points.
+        
+        Args:
+            vertices: `np.ndarray` (dtype: float32, ndim: 2) vertices of triangulation
+            polygon: `np.ndarray` (dtype: float32, ndim: 2) vertices defining polygon
+        """
+        super().__init__()
+        self.vertices = vertices
+        self.polygon = polygon
+        self.modifier = modifier
+
+    def run(self):
+        """Runs the numba function to find the vertices in the selection."""
+        in_poly = _points_in_polygon(self.vertices, self.polygon)
+
+        # emit the finished signal, pass along the calculated values
+        self.finished.emit(in_poly, self.modifier)
+
+
+class ImageLabel(QLabel):
+
+    lasso_finished = pyqtSignal(np.ndarray, int)
+    lasso_progress = pyqtSignal(np.ndarray)
+
+    def __init__(self):
+        super().__init__()
+        self.lasso_enabled = False
+        self._lasso_started = False
+        self._lasso_poly = np.zeros((10000, 2), dtype=np.int32)
+        self._poly_size = 0
+
+    def mousePressEvent(self, ev: QMouseEvent) -> None:
+        super().mousePressEvent(ev)
+        if self.lasso_enabled:
+            self._lasso_started = True
+
+            # polygon defined to always loop back to the start
+            self._lasso_poly[:] = np.array([ev.x(), ev.y()])
+            self._poly_size = 1
+
+    def mouseMoveEvent(self, ev: QMouseEvent) -> None:
+        super().mouseMoveEvent(ev)
+        if self._lasso_started:
+            self._lasso_poly[self._poly_size] = np.array([ev.x(), ev.y()])
+            self._poly_size += 1
+            if self._poly_size == self._lasso_poly.shape[0] - 1:
+                self._lasso_started = False
+                self._poly_size = 0
+                modifiers = ev.modifiers()
+                ctrl = int(bool(modifiers & Qt.ControlModifier))
+                alt = int(bool(modifiers & Qt.AltModifier))
+                self.lasso_finished.emit(self._lasso_poly, ctrl - alt)
+            else:
+                self.lasso_progress.emit(self._lasso_poly[: self._poly_size + 1])
+
+    def mouseReleaseEvent(self, ev: QMouseEvent) -> None:
+        super().mouseReleaseEvent(ev)
+        if len(self._lasso_poly) > 2 and self._lasso_started:
+            self._lasso_started = False
+            modifiers = ev.modifiers()
+            ctrl = int(bool(modifiers & Qt.ControlModifier))
+            alt = int(bool(modifiers & Qt.AltModifier))
+            self.lasso_finished.emit(self._lasso_poly[: self._poly_size + 1], ctrl - alt)
+            self._poly_size = 0
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         """Main application window for triangulating and animating images"""
@@ -179,7 +216,7 @@ class MainWindow(QMainWindow):
         self.grid = QGridLayout()
         self.tabs = QTabWidget()
         self.image = QImage()
-        self.img_label = QLabel()
+        self.img_label = ImageLabel()
 
         # tabs
         self.triangle_tab = QWidget()
@@ -200,6 +237,7 @@ class MainWindow(QMainWindow):
 
         # animation tab
         self.animate_btn = QPushButton()
+        self.animate_editor = None
 
         # 3d animations tab
         self.three_d_btn = QPushButton()
@@ -227,6 +265,7 @@ class MainWindow(QMainWindow):
 
         self.img = np.zeros((self.export_height, self.export_width, 3), dtype=np.uint8)
         self.preview = self.img.copy()
+        self.preview_overlay = self.img.copy()
 
         self.vertices = None
         self.faces = None
@@ -236,7 +275,9 @@ class MainWindow(QMainWindow):
         self.depths = None
 
         self.preview_thread = QThread()
+        self.lasso_thread = QThread()
         self.preview_worker = None
+        self.lasso_worker = None
         self.numba_compiled = False
         self.imported = False
 
@@ -278,6 +319,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.animate_tab, "Animate")
         self.tabs.addTab(self.three_d_tab, "3D")
         self.tabs.addTab(self.export_tab, "Export")
+        self.tabs.currentChanged.connect(self.changed_tab)
 
         # set up triangulation tab - load an image, set triangulation params, calculate
         self.triangle_tab.layout = QVBoxLayout(self.triangle_tab)
@@ -319,6 +361,8 @@ class MainWindow(QMainWindow):
 
         # animations tab - select groups of points and apply animations
         self.animate_tab.layout = QVBoxLayout(self.animate_tab)
+        self.animate_btn.setText("ANIMATE!")
+        self.animate_btn.clicked.connect(self.open_animation_editor)
         self.animate_tab.layout.addWidget(self.animate_btn)
 
         # 3D animations tab - move points into or out of frame to allow 3D effects
@@ -365,7 +409,7 @@ class MainWindow(QMainWindow):
 
         # set up the image, starts out black
         self.image = QImage(
-            self.preview.data,
+            self.preview_overlay.data,
             self.export_width,
             self.export_height,
             QImage.Format_RGB888,
@@ -373,6 +417,9 @@ class MainWindow(QMainWindow):
         self.img_label.setPixmap(QPixmap.fromImage(self.image))
         self.img_frame.layout.addWidget(self.img_label)
         self.img_frame.layout.setAlignment(self.img_label, Qt.AlignCenter)
+
+        self.img_label.lasso_progress.connect(self.draw_lasso)
+        self.img_label.lasso_finished.connect(self.finalize_lasso)
 
         # set up the grid, show the window
         self.grid.addWidget(self.tabs, 0, 0)
@@ -404,6 +451,32 @@ class MainWindow(QMainWindow):
 
         self.preview_thread.quit()
         self.preview_worker.deleteLater()
+
+        # start a new thread for the points_in_polygon function, smaller
+        test_poly = np.array(
+            [[10.0, 0.0], [10.0, 10.0], [20.0, 5.0], [10.0, 0.0]], dtype=np.float32
+        )
+        test_points = np.array([[0.0, 0.0], [11.0, 10.0], [11.0, 5.0]], dtype=np.float32)
+        self.lasso_worker = LassoWorker(test_points, test_poly, 0)
+        self.lasso_worker.moveToThread(self.lasso_thread)
+
+        self.lasso_thread.started.connect(self.lasso_worker.run)
+        self.lasso_worker.finished.connect(self._end_numba_lasso_jit)
+        self.lasso_thread.finished.connect(self.lasso_thread.deleteLater)
+
+        self.lasso_thread.start()
+
+    def _end_numba_lasso_jit(self, *args):
+        """Callback for numba pre-compilation."""
+        self.lasso_thread.quit()
+        self.lasso_worker.deleteLater()
+
+    def changed_tab(self, new_idx):
+        """Call back for changing tab - if animate or 3D tab, allow lasso selection."""
+        if new_idx in [1, 2] and self.vertices is not None:
+            self.img_label.lasso_enabled = True
+        else:
+            self.img_label.lasso_enabled = False
 
     # TODO: when animations are implemented, ask if you want to save your work first
     def import_img(self, _):
@@ -450,16 +523,18 @@ class MainWindow(QMainWindow):
                     int(ow * self.maxd / max(oh, ow)),
                 )
                 self.preview = cv.resize(self.img, (w, h), interpolation=cv.INTER_AREA)
+                self.preview_overlay = self.preview.copy()
             else:
                 h, w = oh, ow
                 self.preview = self.img.copy()
+                self.preview_overlay = self.img.copy()
 
             # display self.preview
             self.image = QImage(
-                self.preview.data,
+                self.preview_overlay.data,
                 w,
                 h,
-                int(self.preview.data.nbytes / h),
+                int(self.preview_overlay.data.nbytes / h),
                 QImage.Format_RGB888,
             )
             self.img_label.setPixmap(QPixmap.fromImage(self.image))
@@ -618,6 +693,7 @@ class MainWindow(QMainWindow):
     ):
         """Collects the triangulation result and shows the preview."""
         self.preview = preview
+        self.preview_overlay = preview.copy()
         self.vertices = vertices
         self.faces = faces
         self.colours = colours
@@ -625,10 +701,10 @@ class MainWindow(QMainWindow):
 
         # set the preview image
         self.image = QImage(
-            self.preview.data,
+            self.preview_overlay.data,
             w,
             h,
-            int(self.preview.data.nbytes / h),
+            int(self.preview_overlay.data.nbytes / h),
             QImage.Format_RGB888,
         )
         self.img_label.setPixmap(QPixmap.fromImage(self.image))
@@ -641,6 +717,81 @@ class MainWindow(QMainWindow):
         # clean up thread
         self.preview_thread.quit()
         self.preview_worker.deleteLater()
+
+    def draw_lasso(self, polygon: np.ndarray):
+        if polygon.shape[0] > 3:
+            vdx = polygon.shape[0] - 4
+            c = 255 * (vdx % 2)
+            cv.line(
+                self.preview_overlay,
+                tuple(polygon[vdx]),
+                tuple(polygon[vdx + 1]),
+                (c, c, c),
+            )
+        self.image = QImage(
+            self.preview_overlay.data,
+            self.preview_overlay.shape[1],
+            self.preview_overlay.shape[0],
+            int(self.preview_overlay.data.nbytes / self.preview_overlay.shape[0]),
+            QImage.Format_RGB888,
+        )
+        self.img_label.setPixmap(QPixmap.fromImage(self.image))
+
+    def finalize_lasso(self, polygon: np.ndarray, modifier: int):
+        h, w, d = self.preview_overlay.shape
+        self.lasso_thread = QThread()
+        self.lasso_worker = LassoWorker(
+            self.vertices * np.array((w - 1, h - 1), dtype=np.float32),
+            polygon.astype(np.float32),
+            modifier,
+        )
+        self.lasso_worker.moveToThread(self.lasso_thread)
+
+        self.lasso_thread.started.connect(self.lasso_worker.run)
+        self.lasso_worker.finished.connect(self.show_selected_points)
+
+        self.lasso_thread.start()
+
+    def show_selected_points(self, selected: np.ndarray, modifier):
+        self.preview_overlay = self.preview.copy()
+        h, w, d = self.preview_overlay.shape
+        if modifier == 0:
+            self.selected = selected
+        elif modifier == 1:
+            self.selected = np.logical_or(self.selected, selected)
+        else:
+            self.selected = np.logical_and(self.selected, np.logical_not(selected))
+        for vdx in range(self.selected.size):
+            if self.selected[vdx]:
+                x, y = tuple(
+                    (
+                        self.vertices[vdx] * np.array((w - 1, h - 1), dtype=np.float32)
+                    ).astype(np.int32)
+                )
+                self.preview_overlay[
+                    max(0, min(h - 1, y - 1)) : max(0, min(h - 1, y + 2)),
+                    max(0, min(w - 1, x - 1)) : max(0, min(w - 1, x + 2)),
+                ] = 255
+                self.preview_overlay[
+                    max(0, min(h - 1, y)) : max(0, min(h - 1, y + 1)),
+                    max(0, min(w - 1, x)) : max(0, min(w - 1, x + 1)),
+                ] = 0
+
+        self.image = QImage(
+            self.preview_overlay.data,
+            self.preview_overlay.shape[1],
+            self.preview_overlay.shape[0],
+            int(self.preview_overlay.data.nbytes / self.preview_overlay.shape[0]),
+            QImage.Format_RGB888,
+        )
+        self.img_label.setPixmap(QPixmap.fromImage(self.image))
+
+        self.lasso_worker.deleteLater()
+        self.lasso_thread.quit()
+        self.lasso_thread.deleteLater()
+
+    def open_animation_editor(self, *args):
+        self.animate_editor = AnimationEditor()
 
     def export_frame(self, _):
         """Exports a static image of a triangulation."""
