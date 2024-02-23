@@ -10,17 +10,38 @@ from typing import Callable
 import cv2 as cv
 import numpy as np
 from PyQt5.QtCore import QObject, Qt, QThread, pyqtSignal
-from PyQt5.QtGui import (QCloseEvent, QColor, QIcon, QImage, QMouseEvent,
-                         QPalette, QPixmap, QValidator)
-from PyQt5.QtWidgets import (QAction, QApplication, QCheckBox, QFileDialog,
-                             QFrame, QGridLayout, QLabel, QLineEdit,
-                             QMainWindow, QMenuBar, QMessageBox, QPushButton,
-                             QSlider, QTabWidget, QToolBar, QVBoxLayout,
-                             QWidget)
+from PyQt5.QtGui import (
+    QCloseEvent,
+    QColor,
+    QIcon,
+    QImage,
+    QMouseEvent,
+    QPalette,
+    QPixmap,
+    QValidator,
+)
+from PyQt5.QtWidgets import (
+    QAction,
+    QApplication,
+    QCheckBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenuBar,
+    QMessageBox,
+    QPushButton,
+    QSlider,
+    QTabWidget,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
 
 from trianimate.render import TriangleShader
-from trianimate.triangulate import (find_colours, find_faces, find_vertices,
-                                    warp_colours)
+from trianimate.triangulate import find_colours, find_faces, find_vertices, warp_colours
 
 WHITE = QColor(255, 255, 255)
 BLACK = QColor(0, 0, 0)
@@ -209,6 +230,7 @@ class MainWindow(QMainWindow):
         self.export_height_txt = QLineEdit()
         self.export_aspect_chk = QCheckBox()
         self.export_frame_btn = QPushButton()
+        self.export_obj_btn = QPushButton()
         self.export_anim_btn = QPushButton()
 
         # preview image/animation
@@ -348,6 +370,10 @@ class MainWindow(QMainWindow):
         self.export_frame_btn.setEnabled(False)
         self.export_frame_btn.clicked.connect(self.export_frame)
 
+        self.export_obj_btn.setText("Export to Wavefront .OBJ")
+        self.export_obj_btn.setEnabled(False)
+        self.export_obj_btn.clicked.connect(self.export_to_wavefront_obj)
+
         self.export_anim_btn.setText("Export Animation")
         self.export_anim_btn.setEnabled(False)
 
@@ -355,6 +381,7 @@ class MainWindow(QMainWindow):
         self.export_tab.layout.addWidget(self.export_height_txt)
         self.export_tab.layout.addWidget(self.export_aspect_chk)
         self.export_tab.layout.addWidget(self.export_frame_btn)
+        self.export_tab.layout.addWidget(self.export_obj_btn)
         self.export_tab.layout.addWidget(self.export_anim_btn)
 
         self.export_tab.layout.addStretch(1)
@@ -470,6 +497,7 @@ class MainWindow(QMainWindow):
                 self.triangle_btn.setEnabled(True)
             # but our triangulation is gone, so we cannot export
             self.export_frame_btn.setEnabled(False)
+            self.export_obj_btn.setEnabled(False)
             self.vertices = None
             self.faces = None
             self.colours = None
@@ -599,7 +627,12 @@ class MainWindow(QMainWindow):
         self.triangle_btn.setText("Working...")
 
         self.preview_worker = TriangulateWorker(
-            self.img, det_val, thr_val, col_val, brt_val, self.maxd,
+            self.img,
+            det_val,
+            thr_val,
+            col_val,
+            brt_val,
+            self.maxd,
         )
         self.preview_thread = QThread()
         self.preview_worker.moveToThread(self.preview_thread)
@@ -635,6 +668,7 @@ class MainWindow(QMainWindow):
 
         # Once we have run a triangulation, we can export!
         self.export_frame_btn.setEnabled(True)
+        self.export_obj_btn.setEnabled(True)
         self.triangle_btn.setEnabled(True)
         self.triangle_btn.setText("Triangulate")
 
@@ -672,6 +706,73 @@ class MainWindow(QMainWindow):
 
         # opencv likes to write BGR for whatever reason :/
         cv.imwrite(filename, cv.cvtColor(result, cv.COLOR_RGB2BGR))
+
+    def export_to_wavefront_obj(self, _):
+        """
+        Refer to https://www.fileformat.info/format/material/
+        and https://www.fileformat.info/format/wavefrontobj/egff.htm
+        """
+        options = QFileDialog.Options()
+        options |= QFileDialog.DontUseNativeDialog
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save OBJ File",
+            "",
+            "OBJ File (*.obj)",
+            options=options,
+        )
+        if filename:
+            p, fn = split(filename)
+            if "." in fn:
+                fn = fn.split(".")[0]
+        else:
+            return
+
+        obj_contents = f"""# Trianimate-generated triangulation
+mtllib {fn}.mtl
+o {fn}
+"""
+        mtl_contents = f"""# Trianimate-generated MTL file for {fn}.obj
+"""
+        mtl_format = """
+newmtl {name}
+Ns 30.0
+Ka 1.00000 1.00000 1.00000
+Kd {red:.3f} {green:.3f} {blue:.3f}
+Ks 0.500000 0.500000 0.500000
+Ke 0.000000 0.000000 0.000000
+Ni 1.450000
+d 1.000000
+illum 2
+"""
+        aspect = self.img.shape[0] / self.img.shape[1]
+        vertices_scaled = np.copy(self.vertices) - 0.5
+        vertices_scaled[:, 1] *= -aspect
+
+        for idx in range(self.vertices.shape[0]):
+            obj_contents += (
+                f"v {vertices_scaled[idx, 0]:.5f} "
+                + f"{vertices_scaled[idx, 1]:.5f} 0.00000\n"
+            )
+        for idx in range(self.faces.shape[0]):
+            obj_contents += (
+                f"usemtl mat{idx}\n"
+                + f"f {self.faces[idx, 0] + 1} "
+                + f"{self.faces[idx, 1] + 1} "
+                + f"{self.faces[idx, 2] + 1}\n"
+            )
+            mtl_contents += mtl_format.format(
+                name=f"mat{idx}",
+                red=self.colours[idx, 0] / 255.0,
+                green=self.colours[idx, 1] / 255.0,
+                blue=self.colours[idx, 2] / 255.0,
+            )
+
+        # write files
+        with open(p + "/" + fn + ".obj", "w+") as f:
+            f.write(obj_contents)
+        with open(p + "/" + fn + ".mtl", "w+") as f:
+            f.write(mtl_contents)
 
     def save_work(self):
         """Write a project file for each image which can be reopened later."""

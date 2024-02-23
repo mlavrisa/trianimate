@@ -1,6 +1,6 @@
 from setuptools import setup, find_packages
 
-VERSION = '0.1.0' 
+VERSION = '0.2.0' 
 DESCRIPTION = 'Trianimate'
 LONG_DESCRIPTION = 'Triangulate images and then animate them!'
 
@@ -18,7 +18,9 @@ setup(
             'scipy',
             'opencv',
             'moderngl',
-            'pyqt'
+            'pyqt',
+            'numba',
+            'qtpynodeeditor'
         ],
         keywords=['python', 'triangulation', 'animation'],
         classifiers= [
