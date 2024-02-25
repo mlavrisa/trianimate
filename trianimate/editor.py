@@ -40,6 +40,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from trianimate.animation_flow_test import init_animation_editor
 from trianimate.render import TriangleShader
 from trianimate.triangulate import find_colours, find_faces, find_vertices, warp_colours
 
@@ -341,6 +342,8 @@ class MainWindow(QMainWindow):
 
         # animations tab - select groups of points and apply animations
         self.animate_tab.layout = QVBoxLayout(self.animate_tab)
+        self.animate_btn.setText("Open Animation Editor")
+        self.animate_btn.clicked.connect(self.open_animation_editor)
         self.animate_tab.layout.addWidget(self.animate_btn)
 
         # 3D animations tab - move points into or out of frame to allow 3D effects
@@ -501,6 +504,14 @@ class MainWindow(QMainWindow):
             self.vertices = None
             self.faces = None
             self.colours = None
+
+    def open_animation_editor(self):
+        view, scene, comps = init_animation_editor(self.vertices, self.get_animation_function)
+        self.anim_view = view
+        self.anim_scene = scene
+    
+    def get_animation_function(self, function):
+        print(function)
 
     def validate_width(self, txt: str) -> bool:
         """Would the resulting resolution be less than 8k?"""

@@ -25,7 +25,7 @@ def sizes_can_broadcast(arr1: np.ndarray, arr2: np.ndarray, exceptions, strict) 
 
     if strict and not arr1.ndim == arr2.ndim:
         return False
-    
+
     dim = min(arr1.ndim, arr2.ndim) if strict else arr1.ndim
 
     return not any(
@@ -70,7 +70,7 @@ class BinaryBroadcastOps(NodeDataModel):
         super().__init__(style=style, parent=parent)
         self._array1: ArrayData = None
         self._array2: ArrayData = None
-        self._axes:ArrayData = None
+        self._axes: ArrayData = None
         self._result: ArrayData = None
         self._validation_state = NodeValidationState.warning
         self._validation_message = "Uninitialized"
@@ -90,7 +90,9 @@ class BinaryBroadcastOps(NodeDataModel):
             not array1_ok
             or not array2_ok
             or not axes_ok
-            or not sizes_can_broadcast(self._array1.array, self._array2.array, dim_exc, strict)
+            or not sizes_can_broadcast(
+                self._array1.array, self._array2.array, dim_exc, strict
+            )
         ):
             self._validation_state = NodeValidationState.warning
             self._validation_message = "Missing or incorrect inputs"
@@ -197,7 +199,7 @@ class DistancesToPoint(BinaryBroadcastOps):
             dim = 1
         res = np.linalg.norm(self._array1.array - self._array2.array, axis=dim)
         self._result = ArrayData(res)
-    
+
     def _additional_checks(self):
         if not np.count_nonzero(np.array(self._array2.array.shape) > 1) == 1:
             return False, NodeValidationState.warning, "'Reference' must be a vector."
@@ -207,7 +209,11 @@ class DistancesToPoint(BinaryBroadcastOps):
         if self._axes.array.size > 1:
             return False, NodeValidationState.warning, "'Vector Axis' size must be 1."
         elif self._array2.array.shape[dim[0]] < 2:
-            return False, NodeValidationState.warning, "'Reference' is a vector in the wrong axis."
+            return (
+                False,
+                NodeValidationState.warning,
+                "'Reference' is a vector in the wrong axis.",
+            )
         return super()._additional_checks()
 
 
@@ -309,7 +315,7 @@ class ReductionOps(NodeDataModel):
     def __init__(self, style=None, parent=None):
         super().__init__(style=style, parent=parent)
         self._array: ArrayData = None
-        self._axes:ArrayData = None
+        self._axes: ArrayData = None
         self._result: ArrayData = None
         self._validation_state = NodeValidationState.warning
         self._validation_message = "Uninitialized"
@@ -322,10 +328,7 @@ class ReductionOps(NodeDataModel):
         array_ok = self._array is not None and self._array.data_type.id == "array"
         axes_ok = self._axes is None or self._axes.data_type.id == "array"
 
-        if (
-            not array_ok
-            or not axes_ok
-        ):
+        if not array_ok or not axes_ok:
             self._validation_state = NodeValidationState.warning
             self._validation_message = "Missing or incorrect inputs"
             self._result = None
@@ -587,19 +590,56 @@ class ScalarInput(NodeDataModel):
         else:
             self._number = ArrayData(np.array([number]))
             self.data_updated.emit(0)
-    name = "Uniform"
-    port_caption = {
-        "input": {
-            0: "Dimensions",
-        },
-        "output": {0: "Array"},
-    }
 
-    def compute(self):
-        self._validation_state = NodeValidationState.valid
-        self._validation_message = ""
-        res = np.random.rand(*self._dimensions.array.ravel().astype(int).tolist())
-        self._result = ArrayData(res)
+
+class VerticesInput(NodeDataModel):
+    name = "Vertices"
+    caption_visible = False
+    num_ports = {
+        PortType.input: 0,
+        PortType.output: 1,
+    }
+    port_caption = {"output": {0: "Vertices (x, y)"}}
+    data_type = ArrayData.data_type
+    vertices = None
+
+    def __init__(self, style=None, parent=None):
+        super().__init__(style=style, parent=parent)
+        self._array: ArrayData = VerticesInput.vertices
+
+    @property
+    def number(self):
+        return self._array
+
+    def save(self) -> dict:
+        "Add to the JSON dictionary to save the state of the NumberSource"
+        doc = super().save()
+        if self._array:
+            doc["array"] = self._array.array.tolist()
+        return doc
+
+    def restore(self, state: dict):
+        "Restore the number from the JSON dictionary"
+        try:
+            value = state["array"]
+        except Exception:
+            ...
+        else:
+            self._array = ArrayData(np.array(value))
+
+    def out_data(self, port: int) -> NodeData:
+        """
+        The data output from this node
+
+        Parameters
+        ----------
+        port : int
+
+        Returns
+        -------
+        value : NodeData
+        """
+        return self._array
 
 
 class Concatenate(BinaryBroadcastOps):
@@ -624,7 +664,7 @@ class Concatenate(BinaryBroadcastOps):
         if self._axes is not None and self._axes.array.size > 1:
             return False, NodeValidationState.warning, "Can only concat on one axis."
         return super()._additional_checks()
-    
+
     def get_broadcast_rules(self):
         if self._axes is not None:
             return True, self._axes.array.ravel().astype(int).tolist()
@@ -636,7 +676,7 @@ class ExpandDims(ReductionOps):
     port_caption = {
         "input": {
             0: "Array",
-            2: "New Axis",
+            1: "New Axis",
         },
         "output": {0: "Array"},
     }
@@ -644,7 +684,9 @@ class ExpandDims(ReductionOps):
     def compute(self):
         self._validation_state = NodeValidationState.valid
         self._validation_message = ""
-        dim = -1 if self._axes is None else self._axes.array.ravel().astype(int).tolist()
+        dim = (
+            -1 if self._axes is None else self._axes.array.ravel().astype(int).tolist()
+        )
         res = np.expand_dims(self._array.array, axis=dim)
         self._result = ArrayData(res)
 
@@ -670,7 +712,9 @@ class InitOp(NodeDataModel):
         return self.name
 
     def _check_inputs(self):
-        dims_ok = self._dimensions is not None and self._dimensions.data_type.id == "array"
+        dims_ok = (
+            self._dimensions is not None and self._dimensions.data_type.id == "array"
+        )
 
         if not dims_ok:
             self._validation_state = NodeValidationState.warning
@@ -806,13 +850,16 @@ class NumberDisplayModel(NodeDataModel):
         return self._label
 
 
-def main(app):
+def init_animation_editor(vertices, callback):
     registry = nodeeditor.DataModelRegistry()
+
+    VerticesInput.vertices = vertices
 
     models = (
         UniformRandomInit,
         Concatenate,
         ScalarInput,
+        VerticesInput,
         AddArrays,
         MultiplyArrays,
         DistancesToPoint,
@@ -875,6 +922,6 @@ def main(app):
 if __name__ == "__main__":
     logging.basicConfig(level="DEBUG")
     app = QApplication([])
-    scene, view, nodes = main(app)
+    scene, view, nodes = init_animation_editor(np.random.rand(15, 2), None)
     view.show()
     app.exec_()
